@@ -24,6 +24,7 @@ import (
 	"github.com/michelangelo-ai/michelangelo/go/api"
 	apiHandler "github.com/michelangelo-ai/michelangelo/go/api/handler"
 	defaultEngine "github.com/michelangelo-ai/michelangelo/go/base/conditions/engine"
+	clientInterfaces "github.com/michelangelo-ai/michelangelo/go/base/workflowclient/interface"
 	"github.com/michelangelo-ai/michelangelo/go/components/pipelinerun/notification"
 	"github.com/michelangelo-ai/michelangelo/go/components/pipelinerun/plugin"
 	"github.com/michelangelo-ai/michelangelo/go/storage"
@@ -54,6 +55,7 @@ type Reconciler struct {
 	engine                 *defaultEngine.DefaultEngine[*v2pb.PipelineRun]
 	apiHandlerFactory      apiHandler.Factory
 	notifier               *notification.PipelineRunNotifier
+	workflowClient         clientInterfaces.WorkflowClient
 }
 
 // NewReconciler creates a new PipelineRun controller reconciler.
@@ -69,6 +71,7 @@ type Reconciler struct {
 //   - notifier: Handles pipeline run notifications for state changes
 //   - config: PipelineRun controller configuration including TTL settings
 //   - metadataStorageConfig: Metadata storage configuration to determine if MySQL backup exists
+//   - workflowClient: Workflow client for querying Cadence/Temporal execution state
 //
 // Returns a configured Reconciler ready to be registered with a controller manager.
 func NewReconciler(
@@ -78,6 +81,7 @@ func NewReconciler(
 	notifier *notification.PipelineRunNotifier,
 	config Config,
 	metadataStorageConfig storage.MetadataStorageConfig,
+	workflowClient clientInterfaces.WorkflowClient,
 ) *Reconciler {
 	logger = logger.With(zap.String("component", "pipelinerun"))
 	return &Reconciler{
@@ -88,6 +92,7 @@ func NewReconciler(
 		engine:                 defaultEngine.NewDefaultEngine[*v2pb.PipelineRun](logger),
 		apiHandlerFactory:      apiHandlerFactory,
 		notifier:               notifier,
+		workflowClient:         workflowClient,
 	}
 }
 
@@ -112,6 +117,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := r.Get(ctx, req.Namespace, req.Name, &metav1.GetOptions{}, pipelineRun); err != nil {
 		return ctrl.Result{}, fmt.Errorf("get pipeline run %q: %w", req.NamespacedName, err)
 	}
+
+	// Reconstruct status from workflow engine if missing (disaster recovery)
+	// This handles cases where status is lost due to etcd corruption, TTL eviction,
+	// or controller restarts during critical updates
+	if r.workflowClient != nil && (pipelineRun.Status.WorkflowId == "" || pipelineRun.Status.WorkflowRunId == "") {
+		workflowID := pipelineRun.Name
+		if exec, err := r.workflowClient.GetWorkflowExecutionInfo(ctx, workflowID, ""); err == nil && exec.Execution != nil {
+			// Restore workflow IDs and derive state from workflow engine
+			pipelineRun.Status.WorkflowId = workflowID
+			pipelineRun.Status.WorkflowRunId = exec.Execution.RunID
+			pipelineRun.Status.State = mapWorkflowStatusToPipelineRunState(exec.Status)
+			logger.Info("reconstructed status from workflow engine",
+				zap.String("workflow_id", workflowID),
+				zap.String("workflow_run_id", exec.Execution.RunID),
+				zap.String("state", pipelineRun.Status.State.String()))
+		}
+		// Continue on error - might be a new pipeline run or workflow engine temporarily unavailable
+	}
+
 	originalPipelineRun := pipelineRun.DeepCopy()
 	conditionResult, err := r.engine.Run(ctx, r.plugin, pipelineRun)
 	result := conditionResult.Result
@@ -240,6 +264,33 @@ func (r *Reconciler) updatePipelineRunStatus(ctx context.Context, pipelineRun *v
 		}
 	}
 	return nil
+}
+
+// mapWorkflowStatusToPipelineRunState converts workflow engine status to pipeline run state.
+//
+// This mapping ensures consistency between the workflow engine's view of execution
+// state and the pipeline run's reported state. The condition engine actors will
+// further refine this state as they execute.
+func mapWorkflowStatusToPipelineRunState(status clientInterfaces.WorkflowExecutionStatus) v2pb.PipelineRunState {
+	switch status {
+	case clientInterfaces.WorkflowExecutionStatusRunning:
+		return v2pb.PIPELINE_RUN_STATE_RUNNING
+	case clientInterfaces.WorkflowExecutionStatusCompleted:
+		return v2pb.PIPELINE_RUN_STATE_SUCCEEDED
+	case clientInterfaces.WorkflowExecutionStatusFailed:
+		return v2pb.PIPELINE_RUN_STATE_FAILED
+	case clientInterfaces.WorkflowExecutionStatusTerminated,
+		clientInterfaces.WorkflowExecutionStatusCanceled:
+		return v2pb.PIPELINE_RUN_STATE_KILLED
+	case clientInterfaces.WorkflowExecutionStatusTimedOut:
+		return v2pb.PIPELINE_RUN_STATE_FAILED
+	case clientInterfaces.WorkflowExecutionStatusContinuedAsNew:
+		// ContinuedAsNew means workflow restarted, treat as running
+		return v2pb.PIPELINE_RUN_STATE_RUNNING
+	default:
+		// Unknown or unspecified status - default to RUNNING and let actors refine
+		return v2pb.PIPELINE_RUN_STATE_RUNNING
+	}
 }
 
 // Register sets up the PipelineRun controller with the controller-runtime manager.

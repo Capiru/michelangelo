@@ -13,6 +13,7 @@ go_library(
         "//go/api:go_default_library",
         "//go/api/handler:go_default_library",
         "//go/base/conditions/engine:go_default_library",
+        "//go/base/workflowclient/interface:go_default_library",
         "//go/components/pipelinerun/notification:go_default_library",
         "//go/components/pipelinerun/plugin:go_default_library",
         "//go/storage:go_default_library",
@@ -30,9 +31,13 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["controller_test.go"],
+    srcs = [
+        "controller_test.go",
+    ],
     embed = [":go_default_library"],
     deps = [
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//mock:go_default_library",
         "//go/api:go_default_library",
         "//go/api/handler:go_default_library",
         "//go/base/blobstore:go_default_library",
