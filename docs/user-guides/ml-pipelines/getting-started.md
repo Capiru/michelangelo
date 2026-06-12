@@ -27,7 +27,6 @@ Each step runs as an isolated, containerized task. Michelangelo handles data pas
 * [Poetry](https://python-poetry.org/) installed
 * For remote runs: Docker and access to a Kubernetes cluster (or use the [local sandbox](../../getting-started/sandbox-setup.md))
 * [Create a project](../project-management-for-ml-pipelines.md)
-* **macOS only**: XGBoost requires OpenMP (`libomp.dylib`), which is not installed by default. Run `brew install libomp` before installing dependencies.
 
 ## Environment setup
 
@@ -320,3 +319,4 @@ See the full Boston Housing XGBoost example at [`python/examples/boston_housing_
 * **Out of memory during training?** Increase `head_memory` or `worker_memory` in your task config, or reduce your dataset size for local runs.
 * **Remote run fails to start?** Verify your Docker image exists and is accessible. Check that `--storage-url` points to a valid S3-compatible bucket.
 * **Workflow code errors with "not supported in Starlark"?** Move the unsupported syntax (imports, try-except, f-strings) into a task function. See [Workflow constraints](#workflow-constraints).
+* **macOS only — XGBoost install fails with `libomp.dylib` not found?** XGBoost requires OpenMP, which is not installed by default on macOS. Run `brew install libomp` before running `poetry install`.
