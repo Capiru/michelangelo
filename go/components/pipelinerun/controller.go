@@ -121,12 +121,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Reconstruct status from workflow engine if missing (disaster recovery)
 	// This handles cases where status is lost due to etcd corruption, TTL eviction,
 	// or controller restarts during critical updates
-	//
-	// IMPORTANT: If a PipelineRun is deleted and recreated with the same name, the new
-	// PipelineRun will have a different K8s UID but the same workflow ID. This can cause
-	// MySQL primary key mismatches (MySQL uses UID as PK, workflow uses name as ID).
-	// Status reconstruction will work, but the MySQL metadata storage will have orphaned
-	// records from the old UID. Avoid recreating PipelineRuns with the same name.
 	if r.workflowClient != nil && (pipelineRun.Status.WorkflowId == "" || pipelineRun.Status.WorkflowRunId == "") {
 		workflowID := pipelineRun.Name
 		if exec, err := r.workflowClient.GetWorkflowExecutionInfo(ctx, workflowID, ""); err == nil && exec.Execution != nil {
@@ -134,11 +128,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			pipelineRun.Status.WorkflowId = workflowID
 			pipelineRun.Status.WorkflowRunId = exec.Execution.RunID
 			pipelineRun.Status.State = mapWorkflowStatusToPipelineRunState(exec.Status)
+
+			// Set stable metadata storage primary key annotation if not already set
+			// This enables consistent identity across cluster migrations where K8s UIDs change
+			annotations := pipelineRun.GetAnnotations()
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			if _, exists := annotations[api.MetadataStoragePrimaryKeyAnnotation]; !exists {
+				// Use current UID as the stable PK for metadata storage (MySQL/Postgres/etc)
+				annotations[api.MetadataStoragePrimaryKeyAnnotation] = string(pipelineRun.UID)
+				pipelineRun.SetAnnotations(annotations)
+				logger.Info("set metadata storage primary key annotation for cross-cluster consistency",
+					zap.String("storage_pk", string(pipelineRun.UID)))
+			}
+
 			logger.Info("reconstructed status from workflow engine",
 				zap.String("workflow_id", workflowID),
 				zap.String("workflow_run_id", exec.Execution.RunID),
 				zap.String("state", pipelineRun.Status.State.String()),
-				zap.String("uid", string(pipelineRun.UID)))
+				zap.String("uid", string(pipelineRun.UID)),
+				zap.String("storage_pk", annotations[api.MetadataStoragePrimaryKeyAnnotation]))
 		}
 		// Continue on error - might be a new pipeline run or workflow engine temporarily unavailable
 	}
