@@ -1,3 +1,5 @@
+import { isRecord } from '#core/utils/object-utils';
+
 /**
  * JSON.stringify with deterministic key ordering. Produces identical output
  * regardless of property insertion order, so `{ a: 1, b: 2 }` and
@@ -5,10 +7,8 @@
  */
 export function serializeKey(value: unknown): string {
   return JSON.stringify(value, (_, val: unknown) => {
-    if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
-      return Object.fromEntries(
-        Object.entries(val as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
-      );
+    if (isRecord(val)) {
+      return Object.fromEntries(Object.entries(val).sort(([a], [b]) => a.localeCompare(b)));
     }
     return val;
   });

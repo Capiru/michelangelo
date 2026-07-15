@@ -52,8 +52,10 @@ export function useColumnTransformer<T extends TableData = TableData>(
         header: column.label,
         cell: (props: CellContext<T, unknown>) => (
           <TableCell<T>
-            column={props.column.columnDef.meta as ColumnConfig}
+            column={props.column.columnDef.meta!}
             row={transformRows<T>([props.row])[0]}
+            // cast: TableData = unknown by convention; row.original is always a plain record
+            // object; see #1416
             record={props.row.original as object}
             value={props.getValue<T>()}
             columnFilterValue={props.column.getFilterValue()}
@@ -63,16 +65,20 @@ export function useColumnTransformer<T extends TableData = TableData>(
         aggregatedCell: (props: CellContext<T, unknown>) =>
           column.aggregatedCell ? (
             <column.aggregatedCell
-              column={props.column.columnDef.meta as ColumnConfig<T>}
+              column={props.column.columnDef.meta!}
+              // cast: TableData = unknown by convention; row.original is always a plain record
+              // object; see #1416
               record={props.row.original as object}
               value={props.getValue<T>()}
             />
           ) : (
             <TableCell<T>
-              column={props.column.columnDef.meta as ColumnConfig}
+              column={props.column.columnDef.meta!}
               row={transformRows<T>([props.row])[0]}
+              // cast: TableData = unknown by convention; row.original is always a plain record
+              // object; see #1416
               record={props.row.original as object}
-              value={props.getValue() as T}
+              value={props.getValue<T>()}
               columnFilterValue={props.column.getFilterValue()}
               setColumnFilterValue={props.column.setFilterValue}
             />

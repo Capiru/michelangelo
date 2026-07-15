@@ -9,8 +9,6 @@ import { TagCell } from './renderers/tag/tag-cell';
 import { TextCell } from './renderers/text/text-cell';
 import { TypeCell } from './renderers/type/type-cell';
 
-import type { CellRenderer } from './types';
-
 export enum CellType {
   /**
    * @description Renders a gray **Tag** with formatted text
@@ -90,16 +88,22 @@ export enum CellType {
   RETRY = 'RETRY',
 }
 
-export const CELL_RENDERERS: Record<string, CellRenderer<unknown>> = {
-  [CellType.BOOLEAN]: BooleanCell as CellRenderer<boolean>,
-  [CellType.DATE]: DateCell as CellRenderer<string>,
+export const CELL_RENDERERS = {
+  [CellType.BOOLEAN]: BooleanCell,
+  [CellType.DATE]: DateCell,
   [CellType.DESCRIPTION]: DescriptionCell,
   [CellType.LINK]: LinkCell,
   [CellType.MULTI]: MultiCell,
   [CellType.REPEATED_ITEMS]: MultiCell,
-  [CellType.RETRY]: RetryCell as CellRenderer<string>,
-  [CellType.STATE]: StateCell as CellRenderer<string>,
+  [CellType.RETRY]: RetryCell,
+  [CellType.STATE]: StateCell,
   [CellType.TAG]: TagCell,
   [CellType.TYPE]: TypeCell,
   [CellType.TEXT]: TextCell,
 };
+
+// Defined here rather than types.ts because it is typeof CELL_RENDERERS — the type is
+// the implementation. Defining it elsewhere would require importing the value, creating
+// a circular dependency. Re-exported from types.ts for consumers who import from there.
+// eslint-disable-next-line local/types-in-types-file
+export type CellRendererRegistry = typeof CELL_RENDERERS;

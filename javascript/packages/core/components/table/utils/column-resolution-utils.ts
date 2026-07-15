@@ -40,13 +40,18 @@ import type { TableData } from '#core/components/table/types/data-types';
  */
 export function resolveColumnForRow<T extends TableData = TableData>(
   column: ColumnConfig<T>,
-  row: T
+  // TableData = unknown makes T extends TableData unconstrained; row: T causes TS2345
+  // when callers pass record: object. Restore row: T once TableData = Record<string, unknown>; see #1416
+  row: unknown
 ): ColumnConfig<T> {
   // TODO: #277 generalize typeMeta.kind access in a type-safe way
   // @ts-expect-error - typeMeta may not exist on generic type T, but we handle it safely with optional chaining
+  // cast: typeMeta.kind is not on the generic T; we access it dynamically and default to '' if
+  // absent
   const kind = (row?.typeMeta?.kind as string) ?? ''; // eslint-disable-line @typescript-eslint/no-unsafe-member-access
 
   // Remove the typeMeta.kind property from the column to avoid infinite recursion
   // if the resolved column is passed to resolveColumnForRow again
+  // cast: does not actually verify the merged spread matches ColumnConfig<T>; see #277
   return kind in column ? ({ ...omit(column, kind), ...column[kind] } as ColumnConfig<T>) : column;
 }

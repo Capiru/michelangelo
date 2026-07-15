@@ -3,6 +3,7 @@ name: build-release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: {}
 jobs:
   build-upload:
     runs-on: ubuntu-latest
@@ -27,10 +28,30 @@ jobs:
         with:
           working-directory: './python'
       #----------------------------------------------
+      #  Normalize the git tag to a PEP 440 version
+      #  (poetry-dynamic-versioning enforces PEP 440, so
+      #  SemVer pre-release tags like v0.4.0-rc.1 must be
+      #  converted to 0.4.0rc1 before build/publish)
+      #----------------------------------------------
+      - name: Normalize version for PyPI (PEP 440)
+        id: pep440
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [[ "$TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}rc${BASH_REMATCH[2]}"
+          else
+            VERSION="$TAG"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Set poetry version
+        run: poetry version "${{ steps.pep440.outputs.version }}"
+      #----------------------------------------------
       #  Build the wheel file
       #----------------------------------------------
       - run: |
           poetry build -f wheel
+        env:
+          POETRY_DYNAMIC_VERSIONING_BYPASS: ${{ steps.pep440.outputs.version }}
       #----------------------------------------------
       #  Publish to PyPI
       #----------------------------------------------
@@ -38,6 +59,8 @@ jobs:
         run: poetry config pypi-token.pypi ${{ secrets.PYPI_API_TOKEN }}
       - name: Publish to PyPI
         run: poetry publish --no-interaction
+        env:
+          POETRY_DYNAMIC_VERSIONING_BYPASS: ${{ steps.pep440.outputs.version }}
       #----------------------------------------------
       #  Upload the wheel file to the release
       #----------------------------------------------
@@ -45,6 +68,64 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           files: python/dist/*.whl
+
+  build-go-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [apiserver, worker, controllermgr]
+        os: [linux, darwin]
+        arch: [amd64, arm64]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go/go.sum
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+          BIN: ${{ github.workspace }}/${{ matrix.service }}-${{ matrix.os }}-${{ matrix.arch }}
+        run: go build -o "$BIN" ./cmd/${{ matrix.service }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.service }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ matrix.service }}-${{ matrix.os }}-${{ matrix.arch }}
+          retention-days: 1
+
+  upload-binaries:
+    needs: build-go-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd binaries
+          sha256sum ./* > checksums-sha256.txt
+
+      - name: Attach binaries and checksums to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: binaries/*
 
   helm-publish:
     runs-on: ubuntu-latest
@@ -87,3 +168,18 @@ jobs:
           helm push \
             michelangelo-${{ steps.version.outputs.VERSION }}.tgz \
             oci://ghcr.io/michelangelo-ai/michelangelo/charts
+
+  notify-on-failure:
+    needs: [build-upload, build-go-binaries, upload-binaries, helm-publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack on failure
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          channel-id: 'C0BER0RCQ8P'
+          slack-message: |
+            :x: *${{ github.workflow }}* failed for ${{ github.ref_name }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

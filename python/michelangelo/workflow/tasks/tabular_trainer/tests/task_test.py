@@ -13,6 +13,7 @@ from michelangelo.workflow.schema.tabular_trainer import (
     BatchIterConfig,
     CheckpointConfig,
     CometConfig,
+    CustomTrackerConfig,
     CustomTrainerConfig,
     DataloadingConfig,
     ExperimentTrackerConfig,
@@ -27,12 +28,10 @@ from michelangelo.workflow.tasks.tabular_trainer.task import (
 from michelangelo.workflow.tasks.tabular_trainer.tests.fixtures import (
     make_model_artifact,
     make_tabular_config,
-    mock_storage_backend,
     mock_train_dataset,
     mock_validation_dataset,
 )
 from michelangelo.workflow.variables.metadata import ModelMetadata
-from michelangelo.workflow.variables.types import ModelArtifact
 
 _TRAINER_TASK = "michelangelo.workflow.tasks.tabular_trainer.task"
 
@@ -147,16 +146,6 @@ class TestModelMetadataRegistryDict(TestCase):
 class TestTrainTabularGuards(TestCase):
     """Tests for train_tabular input validation."""
 
-    def test_missing_storage_backend_raises(self):
-        """Passing storage_backend=None raises ConfigurationError."""
-        with self.assertRaises(ConfigurationError):
-            train_tabular(
-                make_tabular_config(),
-                mock_train_dataset(),
-                mock_validation_dataset(),
-                storage_backend=None,
-            )
-
     def test_custom_backend_raises_not_implemented(self):
         """config.custom raises NotImplementedError."""
         config = TabularTrainerConfig(
@@ -167,7 +156,6 @@ class TestTrainTabularGuards(TestCase):
                 config,
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
 
     def test_save_every_n_steps_raises(self):
@@ -186,7 +174,6 @@ class TestTrainTabularGuards(TestCase):
                 config,
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
 
     def test_transfer_learning_spec_raises(self):
@@ -211,32 +198,17 @@ class TestTrainTabularGuards(TestCase):
                 config,
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
 
-    def test_mlflow_config_raises_not_implemented(self):
-        """ExperimentTrackerConfig(mlflow=...) raises NotImplementedError."""
-        config = make_tabular_config(
-            experiment_tracker=ExperimentTrackerConfig(
-                mlflow=MlflowConfig(
-                    tracking_uri="http://localhost:5000",
-                    experiment_name="test-exp",
-                )
+    def test_mlflow_config_construction_succeeds(self):
+        """MlflowConfig(...) no longer raises at construction (issue #1427 closed)."""
+        cfg = ExperimentTrackerConfig(
+            mlflow=MlflowConfig(
+                tracking_uri="http://localhost:5000",
+                experiment_name="test-exp",
             )
         )
-        with (
-            self.assertRaises(NotImplementedError),
-            patch(
-                f"{_TRAINER_TASK}.get_module_attr",
-                return_value=lambda **kw: Mock(),
-            ),
-        ):
-            train_tabular(
-                config,
-                mock_train_dataset(),
-                mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
-            )
+        self.assertIs(cfg.tracker, cfg.mlflow)
 
     def test_empty_train_dataset_raises(self):
         """Zero-row train dataset raises ConfigurationError."""
@@ -249,7 +221,6 @@ class TestTrainTabularGuards(TestCase):
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.torch"),
             patch(f"{_TRAINER_TASK}.LightningTrainerParam"),
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
@@ -259,7 +230,6 @@ class TestTrainTabularGuards(TestCase):
                 make_tabular_config(),
                 train_ds,
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
 
 
@@ -268,27 +238,25 @@ class TestTrainTabularGuards(TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _run_train(config=None, train_ds=None, val_ds=None, backend=None, **kwargs):
+def _run_train(config=None, train_ds=None, val_ds=None, **kwargs):
     """Run train_tabular with all Ray/Lightning deps mocked."""
     config = config or make_tabular_config()
     train_ds = train_ds or mock_train_dataset()
     val_ds = val_ds or mock_validation_dataset()
-    backend = backend or mock_storage_backend()
     with (
         patch(
             f"{_TRAINER_TASK}.get_module_attr",
             return_value=lambda **kw: Mock(),
         ),
-        patch(f"{_TRAINER_TASK}.torch"),
+        patch(f"{_TRAINER_TASK}.os.path.isfile", return_value=True),
+        patch(f"{_TRAINER_TASK}.ModelVariable") as mv_cls,
         patch(f"{_TRAINER_TASK}.LightningTrainerParam"),
         patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
     ):
         mt.return_value.train.return_value = None
         mt.return_value.update_model_state_dict.return_value = None
-        result = train_tabular(
-            config, train_ds, val_ds, storage_backend=backend, **kwargs
-        )
-    return result, backend, mt
+        result = train_tabular(config, train_ds, val_ds, **kwargs)
+    return result, mv_cls, mt
 
 
 # ---------------------------------------------------------------------------
@@ -299,35 +267,33 @@ def _run_train(config=None, train_ds=None, val_ds=None, backend=None, **kwargs):
 class TestTrainTabularLightning(TestCase):
     """Tests for the lightning success path of train_tabular."""
 
-    def test_returns_model_artifact(self):
-        """Returns a ModelArtifact instance."""
-        result, _, _ = _run_train()
-        self.assertIsInstance(result, ModelArtifact)
+    def test_returns_model_variable(self):
+        """Returns the constructed ModelVariable instance."""
+        result, mv_cls, _ = _run_train()
+        self.assertIs(result, mv_cls.return_value)
 
-    def test_artifact_assembled_false(self):
-        """Returned artifact has assembled=False."""
-        result, _, _ = _run_train()
-        self.assertFalse(result.metadata.assembled)
+    def test_model_variable_save_called(self):
+        """ModelVariable.save() is called once to persist the trained model."""
+        _, mv_cls, _ = _run_train()
+        mv_cls.return_value.save.assert_called_once()
 
-    def test_artifact_deployable_false(self):
-        """Returned artifact has deployable=False."""
-        result, _, _ = _run_train()
-        self.assertFalse(result.metadata.deployable)
+    def test_model_variable_assembled_false(self):
+        """Constructed ModelVariable's metadata has assembled=False."""
+        _, mv_cls, _ = _run_train()
+        metadata = mv_cls.call_args.kwargs["metadata"]
+        self.assertFalse(metadata.assembled)
 
-    def test_artifact_training_framework_lightning(self):
-        """Returned artifact carries training_framework='lightning'."""
-        result, _, _ = _run_train()
-        self.assertEqual(result.metadata.training_framework, "lightning")
+    def test_model_variable_deployable_false(self):
+        """Constructed ModelVariable's metadata has deployable=False."""
+        _, mv_cls, _ = _run_train()
+        metadata = mv_cls.call_args.kwargs["metadata"]
+        self.assertFalse(metadata.deployable)
 
-    def test_storage_backend_upload_called(self):
-        """storage_backend.upload() is called once."""
-        _, backend, _ = _run_train()
-        backend.upload.assert_called_once()
-
-    def test_artifact_path_from_upload(self):
-        """Artifact path equals the URI returned by storage_backend.upload."""
-        result, backend, _ = _run_train()
-        self.assertEqual(result.path, backend.upload.return_value)
+    def test_model_variable_training_framework_lightning(self):
+        """Constructed ModelVariable's metadata carries training_framework."""
+        _, mv_cls, _ = _run_train()
+        metadata = mv_cls.call_args.kwargs["metadata"]
+        self.assertEqual(metadata.training_framework, "lightning")
 
     def test_datasets_loaded(self):
         """load_ray_dataset() is called on both datasets."""
@@ -344,7 +310,7 @@ class TestTrainTabularLightning(TestCase):
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.torch"),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
             patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
@@ -354,7 +320,6 @@ class TestTrainTabularLightning(TestCase):
                 make_tabular_config(),
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
                 is_local_run=False,
             )
         kwargs_dict = mp.call_args.kwargs.get("lightning_trainer_kwargs", {})
@@ -367,7 +332,7 @@ class TestTrainTabularLightning(TestCase):
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.torch"),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
             patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
@@ -377,7 +342,6 @@ class TestTrainTabularLightning(TestCase):
                 make_tabular_config(),
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
                 is_local_run=True,
             )
         kwargs_dict = mp.call_args.kwargs.get("lightning_trainer_kwargs", {})
@@ -396,7 +360,7 @@ class TestTrainTabularLightning(TestCase):
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.torch"),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
             patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
@@ -408,12 +372,11 @@ class TestTrainTabularLightning(TestCase):
                     config,
                     mock_train_dataset(),
                     mock_validation_dataset(),
-                    storage_backend=mock_storage_backend(),
                 )
         self.assertEqual(mp.call_args.kwargs.get("batch_size"), 16)
 
-    def test_comet_param_built_from_experiment_tracker(self):
-        """CometParam is constructed when experiment_tracker.comet is set."""
+    def test_comet_tracker_sets_logger_kwargs(self):
+        """CometConfig resolves to the build_comet_logger dotted path + kwargs."""
         config = make_tabular_config(
             experiment_tracker=ExperimentTrackerConfig(
                 comet=CometConfig(
@@ -429,9 +392,8 @@ class TestTrainTabularLightning(TestCase):
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.CometParam") as mock_comet,
-            patch(f"{_TRAINER_TASK}.torch"),
-            patch(f"{_TRAINER_TASK}.LightningTrainerParam"),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
+            patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
             mt.return_value.train.return_value = None
@@ -440,20 +402,104 @@ class TestTrainTabularLightning(TestCase):
                 config,
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
-        mock_comet.assert_called_once_with(
-            api_key="k", project_name="proj", experiment_name="exp", workspace="ws"
+        lightning_kwargs = mp.call_args.kwargs["lightning_trainer_kwargs"]
+        self.assertEqual(
+            lightning_kwargs["logger"],
+            "michelangelo.lib.trainer.torch.pytorch_lightning._private.util.build_comet_logger",
+        )
+        self.assertEqual(
+            lightning_kwargs["logger_kwargs"],
+            {
+                "api_key": "k",
+                "workspace": "ws",
+                "project_name": "proj",
+                "experiment_name": "exp",
+                "tags": [],
+            },
         )
 
-    def test_no_comet_when_experiment_tracker_none(self):
-        """comet_param is None when experiment_tracker is not set."""
+    def test_mlflow_tracker_sets_logger_kwargs(self):
+        """MlflowConfig resolves to the build_mlflow_logger dotted path + kwargs."""
+        config = make_tabular_config(
+            experiment_tracker=ExperimentTrackerConfig(
+                mlflow=MlflowConfig(
+                    experiment_name="exp",
+                    tracking_uri="http://mlflow.example.com",
+                )
+            )
+        )
         with (
             patch(
                 f"{_TRAINER_TASK}.get_module_attr",
                 return_value=lambda **kw: Mock(),
             ),
-            patch(f"{_TRAINER_TASK}.torch"),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
+            patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
+            patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
+        ):
+            mt.return_value.train.return_value = None
+            mt.return_value.update_model_state_dict.return_value = None
+            train_tabular(
+                config,
+                mock_train_dataset(),
+                mock_validation_dataset(),
+            )
+        lightning_kwargs = mp.call_args.kwargs["lightning_trainer_kwargs"]
+        self.assertEqual(
+            lightning_kwargs["logger"],
+            "michelangelo.lib.trainer.torch.pytorch_lightning._private.util.build_mlflow_logger",
+        )
+        self.assertEqual(
+            lightning_kwargs["logger_kwargs"],
+            {
+                "experiment_name": "exp",
+                "tracking_uri": "http://mlflow.example.com",
+                "run_name": None,
+                "tags": {},
+            },
+        )
+
+    def test_custom_tracker_sets_logger_kwargs(self):
+        """CustomTrackerConfig resolves to its factory_fn + factory_kwargs."""
+        config = make_tabular_config(
+            experiment_tracker=ExperimentTrackerConfig(
+                tracker=CustomTrackerConfig(
+                    factory_fn="myproject.loggers.make_wandb_logger",
+                    factory_kwargs={"project": "ctr-model"},
+                )
+            )
+        )
+        with (
+            patch(
+                f"{_TRAINER_TASK}.get_module_attr",
+                return_value=lambda **kw: Mock(),
+            ),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
+            patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
+            patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
+        ):
+            mt.return_value.train.return_value = None
+            mt.return_value.update_model_state_dict.return_value = None
+            train_tabular(
+                config,
+                mock_train_dataset(),
+                mock_validation_dataset(),
+            )
+        lightning_kwargs = mp.call_args.kwargs["lightning_trainer_kwargs"]
+        self.assertEqual(
+            lightning_kwargs["logger"], "myproject.loggers.make_wandb_logger"
+        )
+        self.assertEqual(lightning_kwargs["logger_kwargs"], {"project": "ctr-model"})
+
+    def test_no_logger_when_experiment_tracker_none(self):
+        """No 'logger' key is set when experiment_tracker is unset."""
+        with (
+            patch(
+                f"{_TRAINER_TASK}.get_module_attr",
+                return_value=lambda **kw: Mock(),
+            ),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
             patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
             patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
         ):
@@ -463,38 +509,95 @@ class TestTrainTabularLightning(TestCase):
                 make_tabular_config(),
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
-        self.assertIsNone(mp.call_args.kwargs.get("comet_param"))
+        lightning_kwargs = mp.call_args.kwargs["lightning_trainer_kwargs"]
+        self.assertNotIn("logger", lightning_kwargs)
 
-    def test_initial_model_triggers_download(self):
-        """storage_backend.download() is called when initial_model is provided."""
-        initial = make_model_artifact(path="s3://bucket/base")
-        _, backend, _ = _run_train(initial_model=initial)
-        backend.download.assert_called_once()
-        self.assertEqual(backend.download.call_args[0][0], "s3://bucket/base")
+    def test_initial_model_sets_weights_path(self):
+        """initial_weights_path is read directly from initial_model.path.
 
-    def test_no_initial_model_no_download(self):
-        """storage_backend.download() is NOT called without initial_model."""
-        _, backend, _ = _run_train()
-        backend.download.assert_not_called()
+        No storage backend is involved — ModelArtifact.path for a lightning
+        warm-start points directly at the state-dict file, matching what
+        LightningTrainerParam.initial_weights_path expects.
+        """
+        initial = make_model_artifact(path="/tmp/base/model.pt")
+        with (
+            patch(
+                f"{_TRAINER_TASK}.get_module_attr",
+                return_value=lambda **kw: Mock(),
+            ),
+            patch(f"{_TRAINER_TASK}.os.path.isfile", return_value=True),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
+            patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
+            patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
+        ):
+            mt.return_value.train.return_value = None
+            mt.return_value.update_model_state_dict.return_value = None
+            train_tabular(
+                make_tabular_config(),
+                mock_train_dataset(),
+                mock_validation_dataset(),
+                initial_model=initial,
+            )
+        self.assertEqual(
+            mp.call_args.kwargs["initial_weights_path"], "/tmp/base/model.pt"
+        )
+
+    def test_initial_model_missing_file_raises(self):
+        """A nonexistent initial_model.path raises ConfigurationError."""
+        initial = make_model_artifact(path="/tmp/definitely_does_not_exist/model.pt")
+        with (
+            self.assertRaises(ConfigurationError),
+            patch(
+                f"{_TRAINER_TASK}.get_module_attr",
+                return_value=lambda **kw: Mock(),
+            ),
+        ):
+            train_tabular(
+                make_tabular_config(),
+                mock_train_dataset(),
+                mock_validation_dataset(),
+                initial_model=initial,
+            )
+
+    def test_no_initial_model_no_weights_path(self):
+        """initial_weights_path is None without initial_model."""
+        with (
+            patch(
+                f"{_TRAINER_TASK}.get_module_attr",
+                return_value=lambda **kw: Mock(),
+            ),
+            patch(f"{_TRAINER_TASK}.ModelVariable"),
+            patch(f"{_TRAINER_TASK}.LightningTrainerParam") as mp,
+            patch(f"{_TRAINER_TASK}.LightningTrainerWithStateDict") as mt,
+        ):
+            mt.return_value.train.return_value = None
+            mt.return_value.update_model_state_dict.return_value = None
+            train_tabular(
+                make_tabular_config(),
+                mock_train_dataset(),
+                mock_validation_dataset(),
+            )
+        self.assertIsNone(mp.call_args.kwargs["initial_weights_path"])
 
     def test_incremental_metadata_propagated(self):
         """is_incremental_training propagates from initial_model."""
         initial = make_model_artifact(
             is_incremental_training=True, baseline_model_identifier="base-v1"
         )
-        result, _, _ = _run_train(initial_model=initial)
-        self.assertTrue(result.metadata.is_incremental_training)
-        self.assertEqual(result.metadata.baseline_model_identifier, "base-v1")
+        _, mv_cls, _ = _run_train(initial_model=initial)
+        metadata = mv_cls.call_args.kwargs["metadata"]
+        self.assertTrue(metadata.is_incremental_training)
+        self.assertEqual(metadata.baseline_model_identifier, "base-v1")
 
     def test_baseline_mode_sets_incremental(self):
         """BASELINE incremental mode sets is_incremental_training=True."""
         config = make_tabular_config(
             incremental_training_mode=IncrementalTrainingModeConfig.BASELINE
         )
-        result, _, _ = _run_train(config=config)
-        self.assertTrue(result.metadata.is_incremental_training)
+        _, mv_cls, _ = _run_train(config=config)
+        metadata = mv_cls.call_args.kwargs["metadata"]
+        self.assertTrue(metadata.is_incremental_training)
 
     def test_metadata_columns_excluded_from_sample(self):
         """metadata_columns are passed to collate_sample_row."""
@@ -517,6 +620,42 @@ class TestTrainTabularLightning(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# train_tabular — default RunConfig storage
+# ---------------------------------------------------------------------------
+
+
+class TestTrainTabularDefaultRunConfig(TestCase):
+    """Tests for train_tabular's default-RunConfig construction."""
+
+    _CREATE_RUN_CONFIG = "michelangelo.uniflow.plugins.ray.run_config.create_run_config"
+
+    def test_none_run_config_delegates_to_create_run_config(self):
+        """run_config=None builds the default via the shared UniFlow helper."""
+        with patch(self._CREATE_RUN_CONFIG) as mock_create:
+            _, _, mt = _run_train()
+        mock_create.assert_called_once()
+        self.assertIs(mt.call_args.kwargs["run_config"], mock_create.return_value)
+
+    def test_create_run_config_receives_checkpoint_config(self):
+        """The default RunConfig is built with the resolved CheckpointConfig."""
+        config = make_tabular_config(checkpoint_config=CheckpointConfig(num_to_keep=3))
+        with patch(self._CREATE_RUN_CONFIG) as mock_create:
+            _run_train(config=config)
+        checkpoint_config = mock_create.call_args.kwargs["checkpoint_config"]
+        self.assertEqual(checkpoint_config.num_to_keep, 3)
+
+    def test_explicit_run_config_not_overridden(self):
+        """An explicitly-passed run_config skips create_run_config entirely."""
+        import ray.train
+
+        explicit = ray.train.RunConfig(storage_path="/explicit/path")
+        with patch(self._CREATE_RUN_CONFIG) as mock_create:
+            _, _, mt = _run_train(run_config=explicit)
+        mock_create.assert_not_called()
+        self.assertIs(mt.call_args.kwargs["run_config"], explicit)
+
+
+# ---------------------------------------------------------------------------
 # train_tabular — dispatch tests
 # ---------------------------------------------------------------------------
 
@@ -528,13 +667,12 @@ class TestTrainTabularDispatch(TestCase):
         """A config with lightning= dispatches to _train_lightning."""
         with patch(
             f"{_TRAINER_TASK}._train_lightning",
-            return_value=ModelArtifact(path="s3://ok", metadata=ModelMetadata()),
+            return_value=Mock(),
         ) as mock_tl:
             train_tabular(
                 make_tabular_config(),
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )
         mock_tl.assert_called_once()
 
@@ -548,5 +686,4 @@ class TestTrainTabularDispatch(TestCase):
                 config,
                 mock_train_dataset(),
                 mock_validation_dataset(),
-                storage_backend=mock_storage_backend(),
             )

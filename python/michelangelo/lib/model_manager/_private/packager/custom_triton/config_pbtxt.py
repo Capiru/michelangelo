@@ -2,11 +2,11 @@
 
 from typing import Optional
 
-from michelangelo.lib.model_manager._private.constants.triton_backend_type import (
-    TritonBackendType,
-)
 from michelangelo.lib.model_manager._private.packager.template_renderer import (
     TritonTemplateRenderer,
+)
+from michelangelo.lib.model_manager.constants.triton_backend_type import (
+    TritonBackendType,
 )
 
 

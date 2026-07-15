@@ -2,7 +2,7 @@ import { FormDialog } from '#core/components/form/components/form-dialog/form-di
 import { StringField } from '#core/components/form/fields/string/string-field';
 import { TextareaField } from '#core/components/form/fields/textarea/textarea-field';
 import { useStudioParams } from '#core/hooks/routing/use-studio-params/use-studio-params';
-import { useStudioMutation } from '#core/hooks/use-studio-mutation';
+import { useStudioMutation } from '#core/hooks/use-studio-mutation/use-studio-mutation';
 import { generateSuffix } from '#core/utils/name-utils';
 
 import type { ActionComponentProps } from '#core/components/actions/types';
@@ -30,9 +30,6 @@ export const CreatePipelineRunForm = ({ record, onClose }: ActionComponentProps<
       namespace: projectId,
     },
     spec: {
-      actor: {
-        name: 'mastudio-user',
-      },
       pipeline: {
         name: record?.metadata?.name ?? '',
         namespace: projectId,

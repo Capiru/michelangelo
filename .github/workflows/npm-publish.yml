@@ -1,40 +1,25 @@
-name: Publish @michelangelo-ai/core to npm
+name: Publish npm packages
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Branch/tag/SHA to publish from (defaults to the calling workflow ref)'
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
       - 'javascript/packages/core/**'
+      - 'javascript/packages/rpc/**'
 
 jobs:
-  check-version-change:
-    runs-on: ubuntu-latest
-    outputs:
-      version-changed: ${{ steps.check.outputs.changed }}
-      new-version: ${{ steps.check.outputs.version }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Check if core package.json version changed
-        id: check
-        run: |
-          if git diff HEAD~1 HEAD --name-only | grep -q "javascript/packages/core/package.json"; then
-            VERSION=$(jq -r '.version' javascript/packages/core/package.json)
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "📦 core version changed to: $VERSION"
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "📦 core version unchanged, skipping publish"
-          fi
-
   publish:
-    needs: check-version-change
-    if: needs.check-version-change.outputs.version-changed == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [core, rpc]
     runs-on: ubuntu-latest
 
     permissions:
@@ -44,8 +29,25 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Check if ${{ matrix.package }} package.json version changed
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff HEAD~1 HEAD --name-only | grep -q "javascript/packages/${{ matrix.package }}/package.json"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "📦 ${{ matrix.package }} version changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "📦 ${{ matrix.package }} version unchanged, skipping publish"
+          fi
 
       - name: Setup Node.js
+        if: steps.check.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 24.14.1
@@ -54,21 +56,43 @@ jobs:
           cache-dependency-path: javascript/yarn.lock
 
       - name: Set up buf CLI
+        if: steps.check.outputs.changed == 'true'
         uses: bufbuild/buf-setup-action@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
         run: |
           cd javascript
           yarn setup
 
-      - name: Build @michelangelo-ai/core
+      - name: Build @michelangelo-ai/${{ matrix.package }}
+        if: steps.check.outputs.changed == 'true'
         run: |
           cd javascript
-          yarn workspace @michelangelo-ai/core build
+          # rpc imports core's built dist/ output at build time. Each matrix
+          # instance is an isolated runner, so core's own "publish (core)" job
+          # never populates it here -- build core first whenever it's needed.
+          if [ "${{ matrix.package }}" = "rpc" ]; then
+            yarn workspace @michelangelo-ai/core build
+          fi
+          yarn workspace @michelangelo-ai/${{ matrix.package }} build
 
       - name: Publish to npm
+        if: steps.check.outputs.changed == 'true'
         run: |
-          cd javascript/packages/core
-          npm publish --provenance --access public
+          cd javascript/packages/${{ matrix.package }}
+          VERSION=$(node -p "require('./package.json').version")
+          PKG=$(node -p "require('./package.json').name")
+          if npm view "$PKG@$VERSION" version > /dev/null 2>&1; then
+            echo "$PKG@$VERSION is already published, skipping."
+            exit 0
+          fi
+          if echo "$VERSION" | grep -q -- '-'; then
+            npm publish --provenance --access public --tag rc
+          else
+            npm publish --provenance --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
